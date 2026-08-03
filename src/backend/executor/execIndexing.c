@@ -660,6 +660,44 @@ ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 }
 
 /*
+ * Equivalent of index_getnext_slot(), with the two additions needed by
+ * check_exclusion_or_unique_constraint():
+ *
+ * - *skippedInvisible is set if an index entry was discarded because no version
+ *   of the tuple it points at was visible to the scan's snapshot.  The caller
+ *   uses that to distinguish "there is definitely nothing here" from "something
+ *   was here but we could not see it".
+ *
+ * - an injection point in the window between reading the index entry and
+ *   checking the heap tuple's visibility, which is where a concurrently
+ *   committing updater makes the scan lose the row.  Tests attach here to drive
+ *   that race deterministically; in a normal build the macro expands to nothing.
+ */
+static bool
+exclusion_getnext_slot(IndexScanDesc scan, ScanDirection direction,
+					   TupleTableSlot *slot, bool *skippedInvisible)
+{
+	for (;;)
+	{
+		if (!scan->xs_heap_continue)
+		{
+			if (index_getnext_tid(scan, direction) == NULL)
+				break;
+		}
+
+		INJECTION_POINT("check-exclusion-or-unique-constraint-before-heap-fetch",
+						NULL);
+
+		if (index_fetch_heap(scan, slot))
+			return true;
+
+		*skippedInvisible = true;
+	}
+
+	return false;
+}
+
+/*
  * Check for violation of an exclusion or unique constraint
  *
  * heap: the table containing the new tuple
@@ -718,6 +756,9 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 	IndexScanDesc index_scan;
 	ScanKeyData scankeys[INDEX_MAX_KEYS];
 	SnapshotData DirtySnapshot;
+	Snapshot	scanSnapshot;
+	bool		mvccRecheck;
+	bool		skippedInvisible;
 	int			i;
 	bool		conflict;
 	bool		found_self;
@@ -783,6 +824,8 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 	 * tuples that aren't visible yet.
 	 */
 	InitDirtySnapshot(DirtySnapshot);
+	scanSnapshot = &DirtySnapshot;
+	mvccRecheck = false;
 
 	for (i = 0; i < indnkeyatts; i++)
 	{
@@ -816,10 +859,12 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 retry:
 	conflict = false;
 	found_self = false;
-	index_scan = index_beginscan(heap, index, &DirtySnapshot, NULL, indnkeyatts, 0);
+	skippedInvisible = false;
+	index_scan = index_beginscan(heap, index, scanSnapshot, NULL, indnkeyatts, 0);
 	index_rescan(index_scan, scankeys, indnkeyatts, NULL, 0);
 
-	while (index_getnext_slot(index_scan, ForwardScanDirection, existing_slot))
+	while (exclusion_getnext_slot(index_scan, ForwardScanDirection, existing_slot,
+								  &skippedInvisible))
 	{
 		TransactionId xwait;
 		XLTW_Oper	reason_wait;
@@ -870,8 +915,15 @@ retry:
 		 * happen often enough to be worth trying harder, and anyway we don't
 		 * want to hold any index internal locks while waiting.
 		 */
-		xwait = TransactionIdIsValid(DirtySnapshot.xmin) ?
-			DirtySnapshot.xmin : DirtySnapshot.xmax;
+
+		/*
+		 * Only a dirty snapshot reports the xid of an in-progress transaction
+		 * affecting this tuple here; on the MVCC verification pass below,
+		 * xmin/xmax are the snapshot's own horizons and must not be waited on.
+		 */
+		xwait = mvccRecheck ? InvalidTransactionId :
+			(TransactionIdIsValid(DirtySnapshot.xmin) ?
+			 DirtySnapshot.xmin : DirtySnapshot.xmax);
 
 		if (TransactionIdIsValid(xwait) &&
 			(waitMode == CEOUC_WAIT ||
@@ -931,6 +983,45 @@ retry:
 	}
 
 	index_endscan(index_scan);
+
+	/*
+	 * If we are about to report "no conflict" even though the scan discarded an
+	 * index entry whose tuple it could not see, that answer cannot be trusted.
+	 * A scan using a non-MVCC snapshot examines a leaf page, then re-checks
+	 * heap visibility afterwards; if a concurrent transaction updates the
+	 * matching row and commits in that window, the old version fails the
+	 * visibility check while the successor's newly inserted index entry is
+	 * never examined, and a live conflicting row is missed entirely.  The dirty
+	 * snapshot does not save us, because it only reports an xid to wait for
+	 * while the other transaction is still in progress.
+	 *
+	 * So verify the negative result exactly once under a fresh MVCC snapshot,
+	 * which cannot lose a row that was live when the snapshot was taken.  This
+	 * is bounded to a single extra pass, and is skipped entirely whenever a
+	 * conflict was found or nothing was discarded, so the ordinary paths are
+	 * unaffected.
+	 *
+	 * We only do this when tupleid is invalid, i.e. when we are checking BEFORE
+	 * the current command has modified anything (the ON CONFLICT arbiter check
+	 * and the logical replication conflict check).  A fresh MVCC snapshot is
+	 * built with curcid = the current command id, so a row version that this
+	 * very command has just superseded still satisfies HeapTupleSatisfiesMVCC
+	 * and would be reported as conflicting with its own successor.  For the
+	 * post-insert exclusion check, which runs with a valid tupleid, we
+	 * therefore keep the historical behaviour.  Likewise in parallel mode,
+	 * where a new snapshot cannot be acquired at all.
+	 */
+	if (!conflict && skippedInvisible && !mvccRecheck &&
+		!ItemPointerIsValid(tupleid) && !IsInParallelMode())
+	{
+		mvccRecheck = true;
+		PushActiveSnapshot(GetLatestSnapshot());
+		scanSnapshot = GetActiveSnapshot();
+		goto retry;
+	}
+
+	if (mvccRecheck)
+		PopActiveSnapshot();
 
 	/*
 	 * Ordinarily, at this point the search should have found the originally
