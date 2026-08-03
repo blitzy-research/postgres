@@ -221,16 +221,23 @@ repl_index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
  * So before we let the caller act on a negative result, we verify it once with
  * a fresh MVCC snapshot.  Returns true, with 'outslot' filled, if the row does
  * in fact exist.
+ *
+ * '*eq' is the caller's equality-comparison cache, shared with the caller's own
+ * scan and allocated here on first use.  The cache deliberately belongs to the
+ * caller because this pass runs once per attempt of a lookup that retries until
+ * it manages to lock the row it found: a cache of our own would leave one array
+ * per attempt behind in the caller's memory context, which is only reset once
+ * the replication message completes.
  */
 static bool
 RelationFindReplTupleUnderLatestSnapshot(Relation rel, Relation idxrel,
 										 ScanKey skey, int skey_attoff,
 										 TupleTableSlot *searchslot,
 										 TupleTableSlot *outslot,
-										 bool isIdxSafeToSkipDuplicates)
+										 bool isIdxSafeToSkipDuplicates,
+										 TypeCacheEntry ***eq)
 {
 	IndexScanDesc scan;
-	TypeCacheEntry **eq = NULL;
 	bool		found = false;
 
 	PushActiveSnapshot(GetLatestSnapshot());
@@ -243,11 +250,11 @@ RelationFindReplTupleUnderLatestSnapshot(Relation rel, Relation idxrel,
 	{
 		if (!isIdxSafeToSkipDuplicates)
 		{
-			if (eq == NULL)
-				eq = palloc0_array(TypeCacheEntry *,
-								   outslot->tts_tupleDescriptor->natts);
+			if (*eq == NULL)
+				*eq = palloc0_array(TypeCacheEntry *,
+									outslot->tts_tupleDescriptor->natts);
 
-			if (!tuples_equal(outslot, searchslot, eq, NULL))
+			if (!tuples_equal(outslot, searchslot, *eq, NULL))
 				continue;
 		}
 
@@ -265,25 +272,26 @@ RelationFindReplTupleUnderLatestSnapshot(Relation rel, Relation idxrel,
 /*
  * Sequential-scan counterpart of RelationFindReplTupleUnderLatestSnapshot().
  * Used for relations with REPLICA IDENTITY FULL and no usable index.
+ *
+ * 'eq' is the caller's equality-comparison cache, reused here for the reason
+ * given in RelationFindReplTupleUnderLatestSnapshot().
  */
 static bool
 RelationFindReplTupleSeqUnderLatestSnapshot(Relation rel,
 											TupleTableSlot *searchslot,
-											TupleTableSlot *outslot)
+											TupleTableSlot *outslot,
+											TypeCacheEntry **eq)
 {
 	TableScanDesc scan;
 	TupleTableSlot *scanslot;
-	TypeCacheEntry **eq;
 	bool		found = false;
-
-	eq = palloc0_array(TypeCacheEntry *, outslot->tts_tupleDescriptor->natts);
 
 	PushActiveSnapshot(GetLatestSnapshot());
 
 	/*
 	 * Unlike the dirty-snapshot scan above, an MVCC snapshot lets the heap AM
-	 * keep page-at-a-time mode enabled, so this pass is no more expensive
-	 * than the scan it verifies.
+	 * keep page-at-a-time mode enabled, so this pass is no more expensive than
+	 * the scan it verifies.
 	 */
 	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
 	scanslot = table_slot_create(rel, NULL);
@@ -399,7 +407,8 @@ retry:
 		found = RelationFindReplTupleUnderLatestSnapshot(rel, idxrel, skey,
 														 skey_attoff,
 														 searchslot, outslot,
-														 isIdxSafeToSkipDuplicates);
+														 isIdxSafeToSkipDuplicates,
+														 &eq);
 	}
 
 	/* Found tuple, try to lock it in the lockmode. */
@@ -578,7 +587,7 @@ retry:
 	{
 		mvccRechecked = true;
 		found = RelationFindReplTupleSeqUnderLatestSnapshot(rel, searchslot,
-															outslot);
+															outslot, eq);
 	}
 
 	/* Found tuple, try to lock it in the lockmode. */
