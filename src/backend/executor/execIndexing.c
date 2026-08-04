@@ -663,16 +663,16 @@ ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
  * Equivalent of index_getnext_slot(), with the two additions needed by
  * check_exclusion_or_unique_constraint():
  *
- * - *skippedInvisible is set whenever index_fetch_heap() exhausts an index
- *   TID without returning another visible heap tuple.  The caller treats this
- *   as a conservative signal that a negative result may need verification.
+ * - *skippedInvisible is set if an index entry was discarded because a heap
+ *   fetch for it found no visible tuple.  The caller uses that to
+ *   distinguish "there is definitely nothing here" from "something was
+ *   here but we could not see it".
  *
  * - an injection point in the window between reading the index entry and
  *   checking the heap tuple's visibility, which is where a concurrently
- *   committing updater makes the scan lose the row.  Tests can attach here to
- *   drive that race deterministically.  When injection points are disabled,
- *   the helper still supplies skippedInvisible, while the marker macro reduces
- *   to a void use of its name and emits no marker code.
+ *   committing updater makes the scan lose the row.  Tests attach here to
+ *   drive that race deterministically; in a normal build the marker macro
+ *   expands to nothing, while the skippedInvisible logic remains.
  */
 static bool
 exclusion_getnext_slot(IndexScanDesc scan, ScanDirection direction,
@@ -918,8 +918,8 @@ retry:
 		 */
 
 		/*
-		 * Only the dirty-snapshot pass sets DirtySnapshot.xmin/xmax; the MVCC
-		 * verification pass below must not use them as a wait target.
+		 * Only a dirty snapshot reports an in-progress writer's xid in
+		 * DirtySnapshot.xmin/xmax, so the MVCC pass below must not wait here.
 		 */
 		xwait = mvccRecheck ? InvalidTransactionId :
 			(TransactionIdIsValid(DirtySnapshot.xmin) ?
@@ -996,19 +996,19 @@ retry:
 	 * wait for while the other transaction is still in progress.
 	 *
 	 * So verify the negative result exactly once under a fresh MVCC snapshot,
-	 * which cannot lose a row that was live when the snapshot was taken.  This
+	 * which cannot lose a row that was live when the snapshot was taken. This
 	 * is bounded to a single extra pass, and is skipped entirely whenever a
 	 * conflict was found or nothing was discarded, so the ordinary paths are
 	 * unaffected.
 	 *
 	 * We only do this when tupleid is invalid, i.e. when we are checking
 	 * BEFORE the current command has modified anything, which is the ON
-	 * CONFLICT arbiter pre-check in ExecInsert().  A fresh MVCC snapshot is
-	 * built with curcid = the current command id, so a row version that this
-	 * very command has just superseded still satisfies HeapTupleSatisfiesMVCC
-	 * and would be reported as conflicting with its own successor.  Callers
-	 * that pass a valid tupleid, such as the post-insert exclusion checks and
-	 * FindConflictTuple(), therefore keep the historical behaviour, as does
+	 * CONFLICT arbiter check.  A fresh MVCC snapshot is built with curcid =
+	 * the current command id, so a row version that this very command has
+	 * just superseded still satisfies HeapTupleSatisfiesMVCC and would be
+	 * reported as conflicting with its own successor.  For the post-insert
+	 * exclusion check and for FindConflictTuple(), which run with a valid
+	 * tupleid, we therefore keep the historical behaviour.  Likewise in
 	 * parallel mode, where a new snapshot cannot be acquired at all.
 	 */
 	if (!conflict && skippedInvisible && !mvccRecheck &&

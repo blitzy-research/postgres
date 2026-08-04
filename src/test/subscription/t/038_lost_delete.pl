@@ -150,13 +150,13 @@ $node_subscriber->wait_for_event('logical replication apply worker',
 $node_subscriber->safe_psql('postgres',
 	"UPDATE lost_delete_tab SET i = i + 1 WHERE a = 1");
 
-# This non-HOT path has no HOT-chain continuation, and the MVCC verification
-# pass uses index_getnext_slot() rather than the marker-hosting wrapper.  The
-# point cannot fire again, so it is safe here to wake before detaching it.
+# Detach the point before waking the worker, as the in-tree tests do: the
+# waiter is registered by name in shared memory, so the wakeup still reaches
+# it, and a detached point cannot park the worker a second time.
 $node_subscriber->safe_psql(
 	'postgres',
-	"SELECT injection_points_wakeup('find-repl-tuple-by-index-before-heap-fetch');
-	 SELECT injection_points_detach('find-repl-tuple-by-index-before-heap-fetch');"
+	"SELECT injection_points_detach('find-repl-tuple-by-index-before-heap-fetch');
+	 SELECT injection_points_wakeup('find-repl-tuple-by-index-before-heap-fetch');"
 );
 
 # Only now can the worker make progress, so only now is it safe to wait for
