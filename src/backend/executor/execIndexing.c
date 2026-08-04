@@ -996,7 +996,7 @@ retry:
 	 * wait for while the other transaction is still in progress.
 	 *
 	 * So verify the negative result exactly once under a fresh MVCC snapshot,
-	 * which cannot lose a row that was live when the snapshot was taken. This
+	 * which cannot lose a row that was live when the snapshot was taken.  This
 	 * is bounded to a single extra pass, and is skipped entirely whenever a
 	 * conflict was found or nothing was discarded, so the ordinary paths are
 	 * unaffected.
