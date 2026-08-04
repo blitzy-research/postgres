@@ -6,21 +6,21 @@
 # TIDs before it checks the visibility of any heap tuple.  s1 is parked in
 # exactly that window, between reading the index entry for the pre-existing
 # key and fetching its heap tuple.  s2 then updates that row and commits, so
-# by the time s1 resumes the cached version is dead, while the successor's
-# freshly inserted index entry is absent from the page copy s1 is reading
-# from.  A dirty snapshot reports an xid to wait for only while the other
-# transaction is still in progress, so the pre-existing wait-and-retry
-# recovery is not armed once s2 has committed: the scan just ends with no
-# rows, and the check would report "no conflict" for a row that existed
-# throughout.  Verifying such a negative result once under a fresh MVCC
-# snapshot, which cannot lose the row, is what keeps the conflict visible.
+# by the time s1 resumes the cached version is no longer visible to the dirty
+# snapshot, while the successor's freshly inserted index entry is absent from
+# the page copy s1 is reading from.  A dirty snapshot reports an xid to wait
+# for only while the other transaction is still in progress, so the
+# pre-existing wait-and-retry recovery is not armed once s2 has committed: the
+# scan just ends with no rows, and the check would report "no conflict" for a
+# row that existed throughout.  Verifying such a negative result once under a
+# fresh MVCC snapshot, which cannot lose the row, is what keeps the conflict
+# visible.
 #
 # The index on the column s2 updates is mandatory, not decoration.  It is
 # what makes s2's update non-HOT, so that a new index entry is written and
-# the HOT chain leading away from the cached version is broken.  A
-# HOT-eligible update would instead carry the scan to the successor version,
-# and then the race cannot be provoked at all, leaving a test that always
-# passes.
+# the HOT chain leading away from the cached version is broken.  A HOT update
+# would instead carry the scan to the successor version, and then the race
+# cannot be provoked at all, leaving a test that always passes.
 #
 # Seeding the table is mandatory for a related reason.  The negative result is
 # only re-examined when the scan discarded an index entry whose tuple it could

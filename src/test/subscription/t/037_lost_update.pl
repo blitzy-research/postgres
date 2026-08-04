@@ -39,17 +39,14 @@ plan skip_all => 'Injection points not supported by this build'
 # Setup
 ###############################
 
-# Create a publisher node
 my $node_publisher = PostgreSQL::Test::Cluster->new('publisher');
 $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->start;
 
-# Create a subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
 $node_subscriber->init(allows_streaming => 'logical');
 $node_subscriber->start;
 
-# Check if the extension injection_points is available
 plan skip_all => 'Extension injection_points not installed'
   unless $node_subscriber->check_extension('injection_points');
 
@@ -88,8 +85,9 @@ $node_publisher->safe_psql(
 # HOT update: it has to insert a new entry into every index of the table,
 # including the primary key that the apply worker's replica identity lookup
 # scans.  That is the precondition for the race driven below, so the index is
-# essential rather than incidental.  The extra column needs a default because
-# the remote tuples that get applied to it are narrower.
+# essential rather than incidental.  The default initializes this local-only
+# column when narrower remote rows are copied or inserted, so the later
+# i = i + 1 update starts from a concrete value.
 $node_subscriber->safe_psql(
 	'postgres', qq[
 	CREATE TABLE lost_update_tab (a int PRIMARY KEY, data text,
@@ -109,7 +107,6 @@ $node_subscriber->safe_psql(
 	 CONNECTION '$publisher_connstr application_name=$appname'
 	 PUBLICATION pub_lost_update;");
 
-# Wait for initial table sync to finish
 $node_subscriber->wait_for_subscription_sync($node_publisher, $appname);
 
 ##################################################
@@ -127,7 +124,6 @@ $node_subscriber->safe_psql('postgres',
 
 my $log_location = -s $node_subscriber->logfile;
 
-# Replicate an UPDATE of the row the apply worker is about to look up.
 $node_publisher->safe_psql('postgres',
 	"UPDATE lost_update_tab SET data = 'frompub' WHERE a = 1");
 
@@ -138,16 +134,17 @@ $node_publisher->safe_psql('postgres',
 $node_subscriber->wait_for_event('logical replication apply worker',
 	'find-repl-tuple-by-index-before-heap-fetch');
 
-# Update the same row locally.  Because the indexed column i changes, this is
-# a non-HOT update: it leaves the old heap tuple dead with an already
-# committed xmax, breaks the HOT chain that led to it, and inserts a fresh
-# primary key entry that the parked scan has already read past.  From here on
-# that scan cannot reach any live version of the row, so its negative result
-# has to be verified under a fresh MVCC snapshot before it is believed.
+# Update the same row locally.  Changing indexed column i forces a non-HOT
+# update.  After it commits, the cached old tuple is no longer visible to the
+# dirty snapshot, no HOT chain reaches the successor, and the cached scan
+# cannot see the successor's new primary-key entry.  The negative result
+# therefore has to be verified under a fresh MVCC snapshot.
 $node_subscriber->safe_psql('postgres',
 	"UPDATE lost_update_tab SET i = i + 1 WHERE a = 1");
 
-# Let the apply worker resume, and detach so that it cannot park again.
+# This non-HOT path has no HOT-chain continuation, and the MVCC verification
+# pass uses index_getnext_slot() rather than the marker-hosting wrapper.  The
+# point cannot fire again, so it is safe here to wake before detaching it.
 $node_subscriber->safe_psql(
 	'postgres',
 	"SELECT injection_points_wakeup('find-repl-tuple-by-index-before-heap-fetch');

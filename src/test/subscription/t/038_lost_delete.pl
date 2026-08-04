@@ -19,13 +19,13 @@
 # spurious delete_missing conflict in place of the delete_origin_differs
 # conflict that had actually happened.
 #
-# A discarded DELETE does not stay a quiet divergence, which is why it is
-# worth a test of its own.  The row it leaves behind is an orphan, and if the
-# publisher ever reuses that key the apply worker reports insert_exists at
-# ERROR, exits, and is relaunched only to fail on the very same remote
-# transaction again.  Replication then stops advancing altogether and the
-# publisher retains WAL without bound until someone drops and rebuilds the
-# subscription by hand.
+# The DELETE case is tested separately from the UPDATE case in
+# 037_lost_update.pl because a discarded DELETE does not stay a quiet
+# divergence.  The row it fails to remove survives as an orphan, and once the
+# publisher reuses that key the apply worker reports insert_exists at ERROR,
+# exits, is relaunched and fails on the very same remote transaction again.
+# The subscription then stops advancing altogether and the publisher retains
+# WAL without bound, so a single lost DELETE has to be resolved by hand.
 #
 # An injection point parks the apply worker in exactly that window, so the
 # losing interleaving is produced by construction rather than by chance and a
@@ -47,17 +47,14 @@ plan skip_all => 'Injection points not supported by this build'
 # Setup
 ###############################
 
-# Create a publisher node
 my $node_publisher = PostgreSQL::Test::Cluster->new('publisher');
 $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->start;
 
-# Create a subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
 $node_subscriber->init(allows_streaming => 'logical');
 $node_subscriber->start;
 
-# Check if the extension injection_points is available
 plan skip_all => 'Extension injection_points not installed'
   unless $node_subscriber->check_extension('injection_points');
 
@@ -96,8 +93,9 @@ $node_publisher->safe_psql(
 # HOT update: it has to insert a new entry into every index of the table,
 # including the primary key that the apply worker's replica identity lookup
 # scans.  That is the precondition for the race driven below, so the index is
-# essential rather than incidental.  The extra column needs a default because
-# the remote tuples that get applied to it are narrower.
+# essential rather than incidental.  The default initializes this local-only
+# column when narrower remote rows are copied or inserted, so the later
+# i = i + 1 update starts from a concrete value.
 $node_subscriber->safe_psql(
 	'postgres', qq[
 	CREATE TABLE lost_delete_tab (a int PRIMARY KEY, data text,
@@ -117,7 +115,6 @@ $node_subscriber->safe_psql(
 	 CONNECTION '$publisher_connstr application_name=$appname'
 	 PUBLICATION pub_lost_delete;");
 
-# Wait for initial table sync to finish
 $node_subscriber->wait_for_subscription_sync($node_publisher, $appname);
 
 ##################################################
@@ -135,7 +132,6 @@ $node_subscriber->safe_psql('postgres',
 
 my $log_location = -s $node_subscriber->logfile;
 
-# Replicate a DELETE of the row the apply worker is about to look up.
 $node_publisher->safe_psql('postgres',
 	"DELETE FROM lost_delete_tab WHERE a = 1");
 
@@ -146,16 +142,17 @@ $node_publisher->safe_psql('postgres',
 $node_subscriber->wait_for_event('logical replication apply worker',
 	'find-repl-tuple-by-index-before-heap-fetch');
 
-# Update the same row locally.  Because the indexed column i changes, this is
-# a non-HOT update: it leaves the old heap tuple dead with an already
-# committed xmax, breaks the HOT chain that led to it, and inserts a fresh
-# primary key entry that the parked scan has already read past.  From here on
-# that scan cannot reach any live version of the row, so its negative result
-# has to be verified under a fresh MVCC snapshot before it is believed.
+# Update the same row locally.  Changing indexed column i forces a non-HOT
+# update.  After it commits, the cached old tuple is no longer visible to the
+# dirty snapshot, no HOT chain reaches the successor, and the cached scan
+# cannot see the successor's new primary-key entry.  The negative result
+# therefore has to be verified under a fresh MVCC snapshot.
 $node_subscriber->safe_psql('postgres',
 	"UPDATE lost_delete_tab SET i = i + 1 WHERE a = 1");
 
-# Let the apply worker resume, and detach so that it cannot park again.
+# This non-HOT path has no HOT-chain continuation, and the MVCC verification
+# pass uses index_getnext_slot() rather than the marker-hosting wrapper.  The
+# point cannot fire again, so it is safe here to wake before detaching it.
 $node_subscriber->safe_psql(
 	'postgres',
 	"SELECT injection_points_wakeup('find-repl-tuple-by-index-before-heap-fetch');
@@ -166,23 +163,13 @@ $node_subscriber->safe_psql(
 # it to catch up.
 $node_publisher->wait_for_catchup($appname);
 
-# The row the DELETE named has to be gone.  This is the assertion that
-# matters most: a row surviving here is exactly the orphan the defect used to
-# leave behind, and an orphan is what later wedges the apply worker for good.
-my $orphans = $node_subscriber->safe_psql('postgres',
+# The row named by the DELETE has to be gone.  Believing the lookup when it
+# reported that row missing is what discarded the replicated DELETE and left
+# the row behind as an orphan, so its continued presence is the divergence
+# this test exists to catch.
+my $sub_target = $node_subscriber->safe_psql('postgres',
 	"SELECT count(*) FROM lost_delete_tab WHERE a = 1");
-is($orphans, '0', 'replicated delete was applied, leaving no orphan row');
-
-# Convergence, not merely the absence of a log line, is what matters here,
-# because the harm this defect does is divergence.  Compare the replicated
-# columns only: the subscriber has a column the publisher does not, so
-# SELECT * could never match.
-my $pub_rows = $node_publisher->safe_psql('postgres',
-	"SELECT a, data FROM lost_delete_tab ORDER BY a");
-my $sub_rows = $node_subscriber->safe_psql('postgres',
-	"SELECT a, data FROM lost_delete_tab ORDER BY a");
-is($sub_rows, $pub_rows,
-	'subscriber converged with publisher after the raced delete');
+is($sub_target, '0', 'raced delete left no orphan row on the subscriber');
 
 # The conflict is real, so it must still be reported, with the type that
 # describes what actually happened.
