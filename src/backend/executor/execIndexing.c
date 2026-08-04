@@ -918,10 +918,8 @@ retry:
 		 */
 
 		/*
-		 * DirtySnapshot.xmin/xmax report an in-progress transaction only for
-		 * the dirty-snapshot pass.  The MVCC verification pass uses
-		 * scanSnapshot and does not update those output fields, so they must
-		 * not be reused as a wait target.
+		 * Only the dirty-snapshot pass sets DirtySnapshot.xmin/xmax; the MVCC
+		 * verification pass below must not use them as a wait target.
 		 */
 		xwait = mvccRecheck ? InvalidTransactionId :
 			(TransactionIdIsValid(DirtySnapshot.xmin) ?
@@ -987,29 +985,29 @@ retry:
 	index_endscan(index_scan);
 
 	/*
-	 * If we are about to report "no conflict" even though the scan discarded an
-	 * index entry whose tuple it could not see, that answer cannot be trusted.
-	 * A scan using a non-MVCC snapshot examines a leaf page, then re-checks
-	 * heap visibility afterwards; if a concurrent transaction updates the
-	 * matching row and commits in that window, the old version fails the
-	 * visibility check while the successor's newly inserted index entry is
-	 * never examined, and a live conflicting row is missed entirely.  The dirty
-	 * snapshot does not save us, because it only reports an xid to wait for
-	 * while the other transaction is still in progress.
+	 * If we are about to report "no conflict" even though the scan discarded
+	 * an index entry whose tuple it could not see, that answer cannot be
+	 * trusted.  A scan using a non-MVCC snapshot examines a leaf page, then
+	 * re-checks heap visibility afterwards; if a concurrent transaction
+	 * updates the matching row and commits in that window, the old version
+	 * fails the visibility check while the successor's newly inserted index
+	 * entry is never examined, and a live conflicting row is missed entirely.
+	 * The dirty snapshot does not save us, because it only reports an xid to
+	 * wait for while the other transaction is still in progress.
 	 *
 	 * So verify the negative result exactly once under a fresh MVCC snapshot,
-	 * which cannot lose a row that was live when the snapshot was taken.  This
+	 * which cannot lose a row that was live when the snapshot was taken. This
 	 * is bounded to a single extra pass, and is skipped entirely whenever a
 	 * conflict was found or nothing was discarded, so the ordinary paths are
 	 * unaffected.
 	 *
-	 * We only do this when tupleid is invalid, i.e. when we are checking BEFORE
-	 * the current command has modified anything, which is the ON CONFLICT
-	 * arbiter pre-check in ExecInsert().  A fresh MVCC snapshot is built with
-	 * curcid = the current command id, so a row version that this very command
-	 * has just superseded still satisfies HeapTupleSatisfiesMVCC and would be
-	 * reported as conflicting with its own successor.  Callers that pass a
-	 * valid tupleid, such as the post-insert exclusion checks and
+	 * We only do this when tupleid is invalid, i.e. when we are checking
+	 * BEFORE the current command has modified anything, which is the ON
+	 * CONFLICT arbiter pre-check in ExecInsert().  A fresh MVCC snapshot is
+	 * built with curcid = the current command id, so a row version that this
+	 * very command has just superseded still satisfies HeapTupleSatisfiesMVCC
+	 * and would be reported as conflicting with its own successor.  Callers
+	 * that pass a valid tupleid, such as the post-insert exclusion checks and
 	 * FindConflictTuple(), therefore keep the historical behaviour, as does
 	 * parallel mode, where a new snapshot cannot be acquired at all.
 	 */
