@@ -1,0 +1,11 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1upsert s2update s2wake s1noop
+step s1upsert: INSERT INTO upsert_tab VALUES (1, 0) ON CONFLICT DO NOTHING; <waiting ...>
+step s2update: UPDATE upsert_tab SET i = i + 1 WHERE a = 1;
+step s2wake: 
+	SELECT FROM injection_points_detach('check-exclusion-or-unique-constraint-before-heap-fetch');
+	SELECT FROM injection_points_wakeup('check-exclusion-or-unique-constraint-before-heap-fetch');
+
+step s1upsert: <... completed>
+step s1noop: 
