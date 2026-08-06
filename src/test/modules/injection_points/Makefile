@@ -15,7 +15,8 @@ REGRESS_OPTS = --dlpath=$(top_builddir)/src/test/regress
 ISOLATION = basic \
 	    inplace \
 	    syscache-update-pruned \
-	    heap_lock_update
+	    heap_lock_update \
+	    exclusion-constraint-recheck
 
 # The injection points are cluster-wide, so disable installcheck
 NO_INSTALLCHECK = 1

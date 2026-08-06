@@ -46,6 +46,8 @@ tests += {
       't/034_temporal.pl',
       't/035_conflicts.pl',
       't/036_sequences.pl',
+      't/037_lost_update.pl',
+      't/038_lost_delete.pl',
       't/100_bugs.pl',
     ],
   },

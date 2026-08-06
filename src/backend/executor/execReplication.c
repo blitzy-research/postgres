@@ -31,6 +31,7 @@
 #include "replication/logicalrelation.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -173,6 +174,138 @@ should_refetch_tuple(TM_Result res, TM_FailureData *tmfd)
 }
 
 /*
+ * Equivalent of index_getnext_slot(), but with an injection point in the window
+ * between reading an index entry and performing the heap visibility check for
+ * it.  That window is exactly where a concurrently committing updater can make
+ * a non-MVCC scan lose the row, so tests must be able to stop the scan there.
+ * In a normal build this is index_getnext_slot() itself, so nothing at all is
+ * added to the apply path.
+ */
+#ifdef USE_INJECTION_POINTS
+static bool
+repl_index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
+						TupleTableSlot *slot)
+{
+	for (;;)
+	{
+		if (!scan->xs_heap_continue)
+		{
+			if (index_getnext_tid(scan, direction) == NULL)
+				break;
+		}
+
+		INJECTION_POINT("find-repl-tuple-by-index-before-heap-fetch", NULL);
+
+		if (index_fetch_heap(scan, slot))
+			return true;
+	}
+
+	return false;
+}
+#else
+#define repl_index_getnext_slot(scan, direction, slot) \
+	index_getnext_slot(scan, direction, slot)
+#endif
+
+/*
+ * Re-run the index lookup under a fresh MVCC snapshot.
+ *
+ * A scan using a non-MVCC snapshot can report "no such row" even though the
+ * row exists throughout, because index and heap scans cache a page's contents
+ * and then re-check visibility afterwards: if a concurrent transaction updates
+ * the row and commits in that window, the cached old version fails the
+ * visibility test while the successor's freshly inserted index entry is never
+ * examined.  An MVCC snapshot is immune, since a tuple that was live when the
+ * snapshot was taken stays live for that snapshot no matter what commits next.
+ *
+ * So before we let the caller act on a negative result, we verify it once with
+ * a fresh MVCC snapshot.  Returns true, with 'outslot' filled, if the row does
+ * in fact exist.
+ */
+static bool
+RelationFindReplTupleUnderLatestSnapshot(Relation rel, Relation idxrel,
+										 ScanKey skey, int skey_attoff,
+										 TupleTableSlot *searchslot,
+										 TupleTableSlot *outslot,
+										 bool isIdxSafeToSkipDuplicates)
+{
+	IndexScanDesc scan;
+	TypeCacheEntry **eq = NULL;
+	bool		found = false;
+
+	PushActiveSnapshot(GetLatestSnapshot());
+
+	scan = index_beginscan(rel, idxrel, GetActiveSnapshot(), NULL,
+						   skey_attoff, 0);
+	index_rescan(scan, skey, skey_attoff, NULL, 0);
+
+	while (index_getnext_slot(scan, ForwardScanDirection, outslot))
+	{
+		if (!isIdxSafeToSkipDuplicates)
+		{
+			if (eq == NULL)
+				eq = palloc0_array(TypeCacheEntry *,
+								   outslot->tts_tupleDescriptor->natts);
+
+			if (!tuples_equal(outslot, searchslot, eq, NULL))
+				continue;
+		}
+
+		ExecMaterializeSlot(outslot);
+		found = true;
+		break;
+	}
+
+	index_endscan(scan);
+	PopActiveSnapshot();
+
+	return found;
+}
+
+/*
+ * Sequential-scan counterpart of RelationFindReplTupleUnderLatestSnapshot().
+ * Used for relations with REPLICA IDENTITY FULL and no usable index.
+ */
+static bool
+RelationFindReplTupleSeqUnderLatestSnapshot(Relation rel,
+											TupleTableSlot *searchslot,
+											TupleTableSlot *outslot)
+{
+	TableScanDesc scan;
+	TupleTableSlot *scanslot;
+	TypeCacheEntry **eq;
+	bool		found = false;
+
+	eq = palloc0_array(TypeCacheEntry *, outslot->tts_tupleDescriptor->natts);
+
+	PushActiveSnapshot(GetLatestSnapshot());
+
+	/*
+	 * Unlike the dirty-snapshot scan above, an MVCC snapshot lets the heap AM
+	 * keep page-at-a-time mode enabled, so this pass is no more expensive
+	 * than the scan it verifies.
+	 */
+	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
+	scanslot = table_slot_create(rel, NULL);
+
+	while (table_scan_getnextslot(scan, ForwardScanDirection, scanslot))
+	{
+		if (!tuples_equal(scanslot, searchslot, eq, NULL))
+			continue;
+
+		ExecCopySlot(outslot, scanslot);
+		found = true;
+		break;
+	}
+
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(scanslot);
+	PopActiveSnapshot();
+
+	return found;
+}
+
+/*
  * Search the relation 'rel' for tuple using the index.
  *
  * If a matching tuple is found, lock it with lockmode, fill the slot with its
@@ -193,6 +326,7 @@ RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
 	bool		found;
 	TypeCacheEntry **eq = NULL;
 	bool		isIdxSafeToSkipDuplicates;
+	bool		mvccRechecked;
 
 	/* Open the index. */
 	idxrel = index_open(idxoid, RowExclusiveLock);
@@ -209,11 +343,12 @@ RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
 
 retry:
 	found = false;
+	mvccRechecked = false;
 
 	index_rescan(scan, skey, skey_attoff, NULL, 0);
 
 	/* Try to find the tuple */
-	while (index_getnext_slot(scan, ForwardScanDirection, outslot))
+	while (repl_index_getnext_slot(scan, ForwardScanDirection, outslot))
 	{
 		/*
 		 * Avoid expensive equality check if the index is primary key or
@@ -246,6 +381,25 @@ retry:
 		/* Found our tuple and it's not locked */
 		found = true;
 		break;
+	}
+
+	/*
+	 * A negative result from the scan above cannot be trusted: the dirty
+	 * snapshot reports an xid to wait for only while the other transaction is
+	 * still in progress, so an updater that committed mid-scan leaves us with
+	 * an empty result and no xid to wait for.  Silently discarding the
+	 * replicated change here is what loses rows on the subscriber, so verify
+	 * the negative result once under a fresh MVCC snapshot before believing
+	 * it.  This costs nothing whenever the row was found, which is the
+	 * overwhelmingly common case.
+	 */
+	if (!found && !mvccRechecked)
+	{
+		mvccRechecked = true;
+		found = RelationFindReplTupleUnderLatestSnapshot(rel, idxrel, skey,
+														 skey_attoff,
+														 searchslot, outslot,
+														 isIdxSafeToSkipDuplicates);
 	}
 
 	/* Found tuple, try to lock it in the lockmode. */
@@ -375,6 +529,7 @@ RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode,
 	TypeCacheEntry **eq;
 	TransactionId xwait;
 	bool		found;
+	bool		mvccRechecked;
 	TupleDesc	desc PG_USED_FOR_ASSERTS_ONLY = RelationGetDescr(rel);
 
 	Assert(equalTupleDescs(desc, outslot->tts_tupleDescriptor));
@@ -388,6 +543,7 @@ RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode,
 
 retry:
 	found = false;
+	mvccRechecked = false;
 
 	table_rescan(scan, NULL);
 
@@ -415,6 +571,14 @@ retry:
 
 		/* Found our tuple and it's not locked */
 		break;
+	}
+
+	/* See the matching comment in RelationFindReplTupleByIndex(). */
+	if (!found && !mvccRechecked)
+	{
+		mvccRechecked = true;
+		found = RelationFindReplTupleSeqUnderLatestSnapshot(rel, searchslot,
+															outslot);
 	}
 
 	/* Found tuple, try to lock it in the lockmode. */
